@@ -47,7 +47,21 @@ INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
 objs := fgetpriority.o
 
-all: fgetpriority_$(FGETPRIORITY_VERSION).kpm
+all: check_kp_dir fgetpriority_$(FGETPRIORITY_VERSION).kpm
+
+# "linux/kernel.h: No such file or directory" at the very first #include
+# almost always means KP_DIR doesn't point at an initialized KernelPatch
+# checkout (submodule not pulled), not a real missing-header bug. Fail fast
+# with a clear reason instead of a confusing compiler error.
+.PHONY: check_kp_dir
+check_kp_dir:
+	@if [ ! -f "$(KP_DIR)/kernel/linux/include/linux/kernel.h" ]; then \
+		echo "error: KernelPatch headers not found under KP_DIR=$(KP_DIR)"; \
+		echo "       (expected $(KP_DIR)/kernel/linux/include/linux/kernel.h to exist)"; \
+		echo "       Run: git submodule update --init --recursive"; \
+		echo "       or build with: make KP_DIR=/path/to/KernelPatch"; \
+		exit 1; \
+	fi
 
 fgetpriority_$(FGETPRIORITY_VERSION).kpm: ${objs}
 	${CC} -r -nostdlib -Wl,--no-eh-frame-hdr -o $@ $^
