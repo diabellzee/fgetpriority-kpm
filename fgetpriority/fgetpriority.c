@@ -84,7 +84,10 @@ static __always_inline bool fgp_should_swap(uid_t who)
  */
 static void before_find_user(hook_fargs1_t *args, void *udata)
 {
-    uid_t who = (uid_t)(args->arg0 & 0xffffffffu);
+    uid_t who;
+
+    (void)udata;
+    who = (uid_t)(args->arg0 & 0xffffffffu);
 
     if (fgp_should_swap(who))
         args->arg0 = (uint64_t)(uint32_t)HIDDEN_PRIORITY_UID;
@@ -93,6 +96,16 @@ static void before_find_user(hook_fargs1_t *args, void *udata)
 static long fgetpriority_init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
+
+    (void)args;
+    (void)reserved;
+
+    if (g_hooked) {
+        /* init() shouldn't normally run twice, but don't double-hook if it
+         * ever does (e.g. a reload without a matching exit()). */
+        fgp_log("init: already hooked, skipping\n");
+        return 0;
+    }
 
     fgp_log("init event=%s\n", event ?: "(null)");
 
@@ -116,12 +129,18 @@ static long fgetpriority_init(const char *args, const char *event, void *__user 
 
 static long fgetpriority_control0(const char *args, char *__user out_msg, int outlen)
 {
+    (void)args;
+    (void)out_msg;
+    (void)outlen;
+
     /* no runtime controls exposed yet */
     return -EINVAL;
 }
 
 static long fgetpriority_exit(void *__user reserved)
 {
+    (void)reserved;
+
     if (g_hooked && g_find_user_addr) {
         hook_unwrap(g_find_user_addr, before_find_user, NULL);
         g_hooked = false;

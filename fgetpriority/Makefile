@@ -1,11 +1,35 @@
 FGETPRIORITY_VERSION := 0.0.4
+V ?= 0
 
+# --- locate ourselves, independent of cwd / how `make` was invoked --------
+# $(CURDIR) only works if make was launched from this directory; `make -C`,
+# a symlinked invocation, or a build run from the repo root would all give
+# a wrong "../KernelPatch". Resolve from MAKEFILE_LIST instead, which is
+# always this file's own real path.
+SELF_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+REPO_ROOT := $(patsubst %/,%,$(dir $(SELF_DIR)))
+
+# --- KP_DIR resolution ------------------------------------------------
+# Try, in order: an explicit `make KP_DIR=...`, a KP_DIR already exported
+# in the environment, then the usual submodule locations relative to this
+# Makefile and to cwd. The first one that actually contains the KernelPatch
+# tree wins; if none do, we fall back to the canonical submodule path so
+# the error message below still points somewhere sensible.
+KP_MARKER := kernel/linux/include/linux/kernel.h
 ifndef KP_DIR
-    KP_DIR = ../KernelPatch
+    KP_CANDIDATES := $(REPO_ROOT)/KernelPatch $(CURDIR)/../KernelPatch $(CURDIR)/KernelPatch
+    KP_FOUND := $(firstword $(foreach d,$(KP_CANDIDATES),$(if $(wildcard $(d)/$(KP_MARKER)),$(d))))
+    ifneq ($(KP_FOUND),)
+        KP_DIR := $(KP_FOUND)
+    else
+        KP_DIR := $(REPO_ROOT)/KernelPatch
+    endif
 endif
+KP_DIR := $(patsubst %/,%,$(KP_DIR))
 
-OS_NAME = $(shell uname | tr A-Z a-z)
-MACHINE = $(shell uname -m)
+# --- toolchain selection -----------------------------------------------
+OS_NAME := $(shell uname | tr A-Z a-z)
+MACHINE := $(shell uname -m)
 NDK_BIN_DIR := toolchains/llvm/prebuilt/$(OS_NAME)-$(MACHINE)/bin
 ifdef ANDROID_NDK_LATEST_HOME
     NDK_PATH ?= $(ANDROID_NDK_LATEST_HOME)/$(NDK_BIN_DIR)
@@ -17,15 +41,22 @@ endif
 
 ifdef TARGET_COMPILE
     CC := $(TARGET_COMPILE)gcc
-    LD := $(TARGET_COMPILE)ld
     OBJCOPY := $(TARGET_COMPILE)objcopy
 else ifdef NDK_PATH
     CC := $(NDK_PATH)/aarch64-linux-android31-clang
-    LD := $(NDK_PATH)/ld.lld
     OBJCOPY := $(NDK_PATH)/llvm-objcopy
 endif
 
-CFLAGS = -Wall -O0 \
+# make(1) always has a built-in CC=cc. If neither TARGET_COMPILE nor an NDK
+# path set CC above, that default would silently compile with the host's
+# compiler instead of failing -- producing an x86-64 (or whatever the host
+# is) .o that still happens to link into a "successful" .kpm. Capture the
+# origin now (outside any recipe, since $(origin) only makes sense here)
+# so check_toolchain below can tell "user/Makefile chose this CC" apart
+# from "make defaulted to it".
+CC_ORIGIN := $(origin CC)
+
+CFLAGS := -Wall -Wextra -O2 \
     -ffreestanding \
     -fno-inline \
     -fno-builtin \
@@ -36,43 +67,93 @@ CFLAGS = -Wall -O0 \
     -fno-unwind-tables \
     -fno-stack-protector \
     -fno-common \
-    -fno-exceptions
-
-CFLAGS += -DFGETPRIORITY_VERSION=\"$(FGETPRIORITY_VERSION)\"
-CFLAGS += -std=gnu99
+    -fno-exceptions \
+    -std=gnu99 \
+    -DFGETPRIORITY_VERSION=\"$(FGETPRIORITY_VERSION)\" \
+    -MMD -MP
 
 INCLUDE_DIRS := . include patch/include linux linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
-
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
-objs := fgetpriority.o
+srcs := $(wildcard *.c)
+objs := $(srcs:.c=.o)
+deps := $(objs:.o=.d)
+target := fgetpriority_$(FGETPRIORITY_VERSION).kpm
 
-all: check_kp_dir fgetpriority_$(FGETPRIORITY_VERSION).kpm
+ifeq ($(V),0)
+    Q := @
+else
+    Q :=
+endif
+
+.PHONY: all clean help check_kp_dir check_toolchain check_arch
+
+all: check_kp_dir check_toolchain check_arch $(target)
 
 # "linux/kernel.h: No such file or directory" at the very first #include
 # almost always means KP_DIR doesn't point at an initialized KernelPatch
-# checkout (submodule not pulled), not a real missing-header bug. Fail fast
-# with a clear reason instead of a confusing compiler error.
-.PHONY: check_kp_dir
+# checkout (submodule not pulled), not a real missing-header bug. Fail
+# fast with the resolved path and the exact fix, instead of a confusing
+# compiler error several lines into the log.
 check_kp_dir:
-	@if [ ! -f "$(KP_DIR)/kernel/linux/include/linux/kernel.h" ]; then \
-		echo "error: KernelPatch headers not found under KP_DIR=$(KP_DIR)"; \
-		echo "       (expected $(KP_DIR)/kernel/linux/include/linux/kernel.h to exist)"; \
-		echo "       Run: git submodule update --init --recursive"; \
-		echo "       or build with: make KP_DIR=/path/to/KernelPatch"; \
+	$(Q)if [ ! -f "$(KP_DIR)/$(KP_MARKER)" ]; then \
+		echo "error: KernelPatch headers not found (checked: $(KP_CANDIDATES))"; \
+		echo "       resolved KP_DIR=$(KP_DIR)"; \
+		echo "       expected to find: $(KP_DIR)/$(KP_MARKER)"; \
+		echo "       fix: git -C \"$(REPO_ROOT)\" submodule update --init --recursive"; \
+		echo "       or:  make KP_DIR=/path/to/KernelPatch"; \
 		exit 1; \
 	fi
 
-fgetpriority_$(FGETPRIORITY_VERSION).kpm: ${objs}
-	${CC} -r -nostdlib -Wl,--no-eh-frame-hdr -o $@ $^
+check_toolchain:
+	$(Q)if [ "$(CC_ORIGIN)" = "default" ] || [ "$(CC_ORIGIN)" = "undefined" ] || [ -z "$(strip $(CC))" ]; then \
+		echo "error: no aarch64 cross compiler selected (CC would default to the host's '$(CC)')."; \
+		echo "       set TARGET_COMPILE=prefix- (e.g. aarch64-none-elf-, aarch64-linux-gnu-)"; \
+		echo "       or point ANDROID_NDK_HOME at an installed NDK"; \
+		echo "       or pass CC=/path/to/aarch64-*-gcc explicitly"; \
+		exit 1; \
+	else \
+		cc_bin="$(firstword $(CC))"; \
+		if ! command -v "$$cc_bin" >/dev/null 2>&1 && [ ! -x "$$cc_bin" ]; then \
+			echo "error: compiler '$$cc_bin' (from CC=$(CC)) not found or not executable"; \
+			exit 1; \
+		fi; \
+	fi
+
+# Defense in depth: even with a plausible-looking CC, verify the objects it
+# actually produced are AArch64 (ELF e_machine == 183 / 0xB7) before we
+# bother linking -- catches a misconfigured/wrong-arch toolchain early
+# instead of shipping a .kpm that will fail to load on-device.
+check_arch: $(objs)
+	$(Q)for f in $(objs); do \
+		m=$$(od -An -tu2 -j 18 -N 2 "$$f" 2>/dev/null | tr -d ' '); \
+		if [ "$$m" != "183" ]; then \
+			echo "error: $$f is not an AArch64 object (e_machine=$${m:-?}, expected 183)"; \
+			echo "       CC=$(CC) is not an aarch64 cross compiler"; \
+			exit 1; \
+		fi; \
+	done
+
+$(target): $(objs)
+	$(Q)echo "  LD      $@"
+	$(Q)$(CC) -r -nostdlib -Wl,--no-eh-frame-hdr -o $@ $^
 ifneq ($(strip $(OBJCOPY)),)
-	${OBJCOPY} --remove-section=.eh_frame --remove-section=.eh_frame_hdr --remove-section=.rela.eh_frame $@
+	$(Q)echo "  OBJCOPY $@"
+	$(Q)$(OBJCOPY) --remove-section=.eh_frame --remove-section=.eh_frame_hdr --remove-section=.rela.eh_frame $@
 endif
+	$(Q)echo "built: $@ (KP_DIR=$(KP_DIR))"
 
 %.o: %.c
-	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -o $@ $<
+	$(Q)echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) $(INCLUDE_FLAGS) -c -o $@ $<
 
-.PHONY: clean
+-include $(deps)
+
 clean:
-	rm -rf *.kpm
-	find . -name "*.o" | xargs rm -f
+	$(Q)rm -f $(objs) $(deps) *.kpm
+
+help:
+	@echo "targets: all (default), clean"
+	@echo "vars:    KP_DIR=path          override KernelPatch checkout (auto-detected otherwise)"
+	@echo "         TARGET_COMPILE=pfx   e.g. aarch64-none-elf- / aarch64-linux-gnu-"
+	@echo "         V=1                  verbose build output"

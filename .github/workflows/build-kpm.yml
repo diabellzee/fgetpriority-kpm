@@ -19,6 +19,10 @@ on:
 
   pull_request:
 
+env:
+  TOOLCHAIN_ARCHIVE: arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf
+  TOOLCHAIN_URL: https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,18 +38,45 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 1
 
-      - name: Install bare-metal aarch64 toolchain
+      - name: Verify KernelPatch submodule was checked out
         run: |
-          curl -L -o toolchain.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
-          tar -Jxf toolchain.tar.xz
+          set -euo pipefail
+          marker="KernelPatch/kernel/linux/include/linux/kernel.h"
+          if [ ! -f "$marker" ]; then
+            echo "::error::$marker is missing -- the KernelPatch submodule did not check out."
+            echo "If you're reproducing this locally: git submodule update --init --recursive"
+            exit 1
+          fi
+          echo "KernelPatch submodule OK ($(git -C KernelPatch rev-parse --short HEAD))"
+
+      - name: Cache aarch64 toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/${{ env.TOOLCHAIN_ARCHIVE }}
+          key: toolchain-${{ env.TOOLCHAIN_ARCHIVE }}-v1
+
+      - name: Install bare-metal aarch64 toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 -o toolchain.tar.xz "${TOOLCHAIN_URL}"
+          # fail loudly on a truncated/HTML-error download instead of letting
+          # `tar` fail later with a confusing "unexpected end of file"
+          tar -tJf toolchain.tar.xz >/dev/null
+          tar -xJf toolchain.tar.xz
+          rm -f toolchain.tar.xz
+          test -x "${TOOLCHAIN_ARCHIVE}/bin/aarch64-none-elf-gcc"
 
       - name: Build fgetpriority.kpm
         env:
-          TARGET_COMPILE: ${{ github.workspace }}/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-
+          TARGET_COMPILE: ${{ github.workspace }}/${{ env.TOOLCHAIN_ARCHIVE }}/bin/aarch64-none-elf-
         run: |
-          make -C fgetpriority
+          set -euo pipefail
+          make -C fgetpriority V=1
           mkdir -p target
           mv fgetpriority/*.kpm target/
+          ls -la target/
 
       - name: Upload artifact
         if: success()
