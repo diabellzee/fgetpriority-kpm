@@ -22,6 +22,8 @@ on:
 env:
   TOOLCHAIN_ARCHIVE: arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf
   TOOLCHAIN_URL: https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+  # Pinned KernelPatch commit this module was last built/verified against.
+  KP_REF: 0ceeeb968bef86b48af68640af8b135215dc3399
 
 jobs:
   build:
@@ -35,19 +37,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Best-effort: works if the repo registered KernelPatch as a real
+          # submodule gitlink (`git submodule add`, not just a committed
+          # .gitmodules file). The "Fetch KernelPatch" step below is the
+          # real source of truth and does not depend on this having worked.
           submodules: 'recursive'
           fetch-depth: 1
 
-      - name: Verify KernelPatch submodule was checked out
+      - name: Fetch KernelPatch
         run: |
           set -euo pipefail
           marker="KernelPatch/kernel/linux/include/linux/kernel.h"
-          if [ ! -f "$marker" ]; then
-            echo "::error::$marker is missing -- the KernelPatch submodule did not check out."
-            echo "If you're reproducing this locally: git submodule update --init --recursive"
-            exit 1
+          if [ -f "$marker" ]; then
+            echo "KernelPatch already present via submodule checkout ($(git -C KernelPatch rev-parse --short HEAD 2>/dev/null || echo unknown))"
+          else
+            echo "No usable KernelPatch submodule checkout found; cloning KernelPatch@${KP_REF} directly."
+            rm -rf KernelPatch
+            git clone https://github.com/bmax121/KernelPatch.git KernelPatch
+            git -C KernelPatch checkout --quiet "${KP_REF}"
           fi
-          echo "KernelPatch submodule OK ($(git -C KernelPatch rev-parse --short HEAD))"
+          test -f "$marker" || { echo "::error::$marker still missing after fetch"; exit 1; }
 
       - name: Cache aarch64 toolchain
         id: cache-toolchain
