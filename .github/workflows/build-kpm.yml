@@ -1,0 +1,70 @@
+name: Build KPM
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-kpm.yml"
+      - "fgetpriority/**"
+
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Push a new release'
+        required: false
+        default: 'false'
+      version:
+        description: 'release version'
+        required: false
+        default: '0.0.4-kpm1'
+
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TZ: UTC-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 1
+
+      - name: Install bare-metal aarch64 toolchain
+        run: |
+          curl -L -o toolchain.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -Jxf toolchain.tar.xz
+
+      - name: Build fgetpriority.kpm
+        env:
+          TARGET_COMPILE: ${{ github.workspace }}/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-
+        run: |
+          make -C fgetpriority
+          mkdir -p target
+          mv fgetpriority/*.kpm target/
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fgetpriority-kpm
+          path: target/*.kpm
+          if-no-files-found: error
+
+      - name: Upload release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true' && success()
+        uses: ncipollo/release-action@v1.14.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ github.event.inputs.version }}
+          tag: ${{ github.event.inputs.version }}
+          body: "fgetpriority KPM build, see README.md for compatibility notes."
+          artifacts: "target/*.kpm"
+          allowUpdates: true
+          makeLatest: true
+          omitBodyDuringUpdate: true
+          replacesArtifacts: true
