@@ -25,6 +25,12 @@
 
 /* --- uid ranges, mirrored from the LKM's routine.h ------------------- */
 
+/* Single source of truth for the human-readable module version: used both
+ * for KPM_VERSION() (the loader-visible metadata) and for the `status`
+ * control0 reply, so the two can never drift apart. This is independent of
+ * the Makefile's FGETPRIORITY_VERSION, which only names the output file. */
+#define FGP_KPM_VERSION "0.0.4-kpm2"
+
 #define MIN_APP_PROCESS_UID      10000
 #define MIN_ISOLATED_PROCESS_UID 90000
 #define AID_USER_OFFSET          100000

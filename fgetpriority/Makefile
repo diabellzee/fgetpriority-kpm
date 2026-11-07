@@ -1,20 +1,9 @@
 FGETPRIORITY_VERSION := 0.0.4
 V ?= 0
 
-# --- locate ourselves, independent of cwd / how `make` was invoked --------
-# $(CURDIR) only works if make was launched from this directory; `make -C`,
-# a symlinked invocation, or a build run from the repo root would all give
-# a wrong "../KernelPatch". Resolve from MAKEFILE_LIST instead, which is
-# always this file's own real path.
 SELF_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 REPO_ROOT := $(patsubst %/,%,$(dir $(SELF_DIR)))
 
-# --- KP_DIR resolution ------------------------------------------------
-# Try, in order: an explicit `make KP_DIR=...`, a KP_DIR already exported
-# in the environment, then the usual submodule locations relative to this
-# Makefile and to cwd. The first one that actually contains the KernelPatch
-# tree wins; if none do, we fall back to the canonical submodule path so
-# the error message below still points somewhere sensible.
 KP_MARKER := kernel/linux/include/linux/kernel.h
 ifndef KP_DIR
     KP_CANDIDATES := $(REPO_ROOT)/KernelPatch $(CURDIR)/../KernelPatch $(CURDIR)/KernelPatch
@@ -27,7 +16,6 @@ ifndef KP_DIR
 endif
 KP_DIR := $(patsubst %/,%,$(KP_DIR))
 
-# --- toolchain selection -----------------------------------------------
 OS_NAME := $(shell uname | tr A-Z a-z)
 MACHINE := $(shell uname -m)
 NDK_BIN_DIR := toolchains/llvm/prebuilt/$(OS_NAME)-$(MACHINE)/bin
@@ -47,13 +35,6 @@ else ifdef NDK_PATH
     OBJCOPY := $(NDK_PATH)/llvm-objcopy
 endif
 
-# make(1) always has a built-in CC=cc. If neither TARGET_COMPILE nor an NDK
-# path set CC above, that default would silently compile with the host's
-# compiler instead of failing -- producing an x86-64 (or whatever the host
-# is) .o that still happens to link into a "successful" .kpm. Capture the
-# origin now (outside any recipe, since $(origin) only makes sense here)
-# so check_toolchain below can tell "user/Makefile chose this CC" apart
-# from "make defaulted to it".
 CC_ORIGIN := $(origin CC)
 
 CFLAGS := -Wall -Wextra -O2 \
@@ -90,11 +71,6 @@ endif
 
 all: check_kp_dir check_toolchain check_arch $(target)
 
-# "linux/kernel.h: No such file or directory" at the very first #include
-# almost always means KP_DIR doesn't point at an initialized KernelPatch
-# checkout (submodule not pulled), not a real missing-header bug. Fail
-# fast with the resolved path and the exact fix, instead of a confusing
-# compiler error several lines into the log.
 check_kp_dir:
 	$(Q)if [ ! -f "$(KP_DIR)/$(KP_MARKER)" ]; then \
 		echo "error: KernelPatch headers not found (checked: $(KP_CANDIDATES))"; \
@@ -120,10 +96,6 @@ check_toolchain:
 		fi; \
 	fi
 
-# Defense in depth: even with a plausible-looking CC, verify the objects it
-# actually produced are AArch64 (ELF e_machine == 183 / 0xB7) before we
-# bother linking -- catches a misconfigured/wrong-arch toolchain early
-# instead of shipping a .kpm that will fail to load on-device.
 check_arch: $(objs)
 	$(Q)for f in $(objs); do \
 		m=$$(od -An -tu2 -j 18 -N 2 "$$f" 2>/dev/null | tr -d ' '); \

@@ -1,45 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/*
- * fgetpriority — KPM port
- *
- * Original LKM filtered sys_getpriority / sys_setpriority / sys_ioprio_get /
- * sys_ioprio_set by self-patching ARM64 B/BL call sites (routine_raw.c) to
- * redirect find_user() to a shadow gphook_find_user(), with a kprobe
- * fallback (routine_kp.c) that rewrote find_user()'s first argument before
- * the real function ran.
- *
- * KernelPatch already does inline function hooking for us (hook_wrap), so
- * this port keeps only the kprobe-style strategy: hook find_user() once and
- * rewrite its kuid_t argument in the "before" callback. Because hook_wrap
- * patches find_user() itself rather than its call sites, every caller
- * (sys_getpriority, sys_setpriority, sys_ioprio_get, sys_ioprio_set) is
- * covered automatically — the LKM's four separate call-site patches are not
- * needed here.
- *
- * KNOWN DEVIATIONS FROM THE LKM (see fgetpriority.h / README for detail):
- *   - The isolated/work-profile uid -> host uid translation via
- *     current_cred()->user_ns (make_kuid/from_kuid) is NOT ported: this KPM
- *     build environment only exposes forward-declared, offset-indirected
- *     struct cred / user_namespace, so touching those fields directly here
- *     would mean guessing per-kernel-version layouts, which is how kernel
- *     modules crash devices. Plain modulo-AID_USER_OFFSET normalization is
- *     kept, which covers the common (non-namespaced) isolated-uid case.
- *   - The is_seccomp_enabled() gate (TIF_SECCOMP) is NOT ported, for the
- *     same reason: thread_info flag layout isn't exposed here. Since the
- *     filter already requires both uids to be >= MIN_APP_PROCESS_UID, this
- *     only widens the filter to app-uid callers that aren't currently
- *     seccomp-filtered, which in practice is rare on Android.
- * Both can be added back with hook-based struct-offset resolution if you
- * need them; ask and I'll wire that up against a specific kernel/KMI.
- */
 
 #include <linux/kernel.h>
 #include <linux/printk.h>
-
 #include "fgetpriority.h"
 
 KPM_NAME("fgetpriority");
-KPM_VERSION("0.0.4-kpm1");
+KPM_VERSION(FGP_KPM_VERSION);
 KPM_LICENSE("GPL-2.0-only");
 KPM_AUTHOR("xx, frknkrc44");
 KPM_DESCRIPTION("Filters sys_getpriority/setpriority/ioprio_get/ioprio_set to hide cross-app uid relationships");
@@ -114,7 +80,11 @@ static long fgetpriority_init(const char *args, const char *event, void *__user 
         fgp_err("cannot find find_user\n");
         return -ENOENT;
     }
-    fgp_log("find_user @ %px\n", g_find_user_addr);
+    /* %p (hashed), not %px: a module whose entire purpose is hiding things
+     * from userspace shouldn't be the one leaking a real, KASLR-defeating
+     * kernel address into dmesg, which unprivileged processes can often
+     * still read depending on kptr_restrict/dmesg_restrict. */
+    fgp_log("find_user resolved @ %p\n", g_find_user_addr);
 
     err = hook_wrap1(g_find_user_addr, before_find_user, NULL, NULL);
     if (err) {
@@ -127,14 +97,64 @@ static long fgetpriority_init(const char *args, const char *event, void *__user 
     return 0;
 }
 
+/* Minimal, dependency-free string compare -- avoids pulling in the
+ * kfunc-resolved <linux/string.h> helpers (strcmp et al.) just for a
+ * handful of fixed control-command literals. `args` comes from the
+ * kpatch CLI / caller, not from an untrusted remote source, but we still
+ * treat it as not-necessarily-NUL-bounded-sanely and cap the scan. */
+static bool fgp_args_is(const char *args, const char *lit)
+{
+    int i;
+
+    if (!args)
+        return false;
+
+    for (i = 0; i < 64; i++) {
+        if (args[i] != lit[i])
+            return false;
+        if (args[i] == '\0')
+            return true;
+    }
+    return false;
+}
+
+/*
+ * `kpatch kpm control fgetpriority status` (or the APatch UI's module
+ * control box) -> quick on-device sanity check without needing to grep
+ * dmesg: is the hook actually installed right now, and does find_user
+ * still resolve to the same address we hooked (catches the unlikely case
+ * of something else having unhooked/rehooked it from under us).
+ */
 static long fgetpriority_control0(const char *args, char *__user out_msg, int outlen)
 {
-    (void)args;
-    (void)out_msg;
-    (void)outlen;
+    char buf[96];
+    int len;
+    int copied;
+    void *live_addr;
 
-    /* no runtime controls exposed yet */
-    return -EINVAL;
+    if (!out_msg || outlen <= 0)
+        return -EINVAL;
+
+    if (!fgp_args_is(args, "status"))
+        return -EINVAL;
+
+    live_addr = g_hooked ? (void *)kallsyms_lookup_name("find_user") : NULL;
+
+    len = snprintf(buf, sizeof(buf), "version=%s hooked=%d find_user_live=%d\n",
+                   FGP_KPM_VERSION, g_hooked ? 1 : 0,
+                   (g_hooked && live_addr == g_find_user_addr) ? 1 : 0);
+    if (len <= 0)
+        return -EFAULT;
+    if (len >= (int)sizeof(buf))
+        len = (int)sizeof(buf) - 1; /* truncated, still useful */
+    if (len > outlen)
+        len = outlen;
+
+    copied = compat_copy_to_user(out_msg, buf, len);
+    if (copied != len)
+        return -EFAULT;
+
+    return 0;
 }
 
 static long fgetpriority_exit(void *__user reserved)
